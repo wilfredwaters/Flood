@@ -1,49 +1,43 @@
+#!/usr/bin/env python3.12
+"""
+Download Overture Maps building footprints and POIs for CONUS regions,
+saving each region separately as Geoparquet files on the thumbdrive.
+"""
+
 import overturemaps as om
 import os
-from concurrent.futures import ThreadPoolExecutor
 
-# Output base folder
-output_base = "/Volumes/Tooth/FloodProject/02_Overture"
+# Thumbdrive paths
+#BUILDINGS_DIR = "/Volumes/Tooth/FloodProject/02_Overture/Buildings"
+POIS_DIR = "/Volumes/Tooth/FloodProject/02_Overture/POIs"
+
+# Ensure output directories exist
+#os.makedirs(BUILDINGS_DIR, exist_ok=True)
+os.makedirs(POIS_DIR, exist_ok=True)
 
 # CONUS regions
 regions = {
     "Northeast": (-80.0, 37.0, -66.9, 49.4),
-    "Midwest": (-104.0, 36.5, -80.0, 49.4),
-    "South": (-104.0, 24.0, -75.0, 37.0),
-    "West": (-125.0, 32.0, -104.0, 49.4)
+    "Midwest":   (-104.0, 36.5, -80.0, 49.4),
+    "South":     (-104.0, 24.0, -75.0, 37.0),
+    "West":      (-125.0, 32.0, -104.0, 49.4)
 }
 
-# Ensure folders exist
-os.makedirs(f"{output_base}/Buildings", exist_ok=True)
-os.makedirs(f"{output_base}/POIs", exist_ok=True)
-
-def download_region(region_name, bbox):
-    # Download buildings
-  '''
-    print(f"Downloading buildings for {region_name}...")
-    om.download(
-        data_type="building",
+# Function to download a dataset for a region
+def download_region(dataset: str, region_name: str, bbox: tuple, output_dir: str):
+    output_file = os.path.join(output_dir, f"{dataset}_{region_name.lower()}.parquet")
+    print(f"Downloading {dataset} for {region_name} → {output_file} ...")
+    om.fetch(
+        dataset=dataset,
         bbox=bbox,
-        fmt="geoparquet",
-        output=f"{output_base}/Buildings/buildings_{region_name}.parquet"
+        format="geoparquet",
+        output_path=output_file
     )
-   ''' 
-    # Download POIs
-    print(f"Downloading POIs for {region_name}...")
-    om.download(
-        data_type="place",
-        bbox=bbox,
-        fmt="geoparquet",
-        output=f"{output_base}/POIs/pois_{region_name}.parquet"
-    )
-    print(f"{region_name} download complete!")
+    print(f"Completed {dataset} for {region_name}")
 
-# Use ThreadPoolExecutor to download all regions in parallel
-with ThreadPoolExecutor(max_workers=4) as executor:
-    futures = [executor.submit(download_region, name, bbox) for name, bbox in regions.items()]
-    
-    # Wait for all to finish
-    for future in futures:
-        future.result()
+# Main download loop
+for region_name, bbox in regions.items():
+ #   download_region("building", region_name, bbox, BUILDINGS_DIR)
+    download_region("place", region_name, bbox, POIS_DIR)
 
-print("All regions downloaded!")
+print("All downloads completed!")
