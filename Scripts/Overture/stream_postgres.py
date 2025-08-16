@@ -1,85 +1,44 @@
-#!/usr/bin/env python3.13
-"""
-Stream large Parquet files into PostGIS in chunks.
-Automatically creates tables with schema inferred from Parquet,
-reprojects to EPSG:5070, and creates a GIST spatial index.
-"""
-
-from pathlib import Path
-import pyarrow.parquet as pq
+import pandas as pd
 import geopandas as gpd
+from shapely import wkb
 from sqlalchemy import create_engine
-import psycopg2
+from sqlalchemy import text
 
-# ------------------------
-# Configuration
-# ------------------------
-USER = "docker"
-PASSWORD = "docker"
-HOST = "localhost"
-PORT = "25432"
-DBNAME = "My Test PostGIS"
-SCHEMA = "public"
-EPSG_TARGET = 5070
-CHUNK_SIZE = 25000  # rows per chunk
+# PostgreSQL connection — adjust your user, password, host, db
+engine = create_engine("postgresql+psycopg2://user:password@localhost:5432/mydb")
 
-BASE_DIR = Path("/Volumes/Tooth/FloodProject/02_Overture")
-PARQUET_DIR_BUILDINGS = BASE_DIR / "Buildings"
+CHUNK_SIZE = 25000
+TARGET_CRS = "EPSG:5070"  # USA Contiguous Albers
 
-# ------------------------
-# Database connection
-# ------------------------
-conn_str = f"postgresql+psycopg2://{USER}:{PASSWORD}@{HOST}:{PORT}/{DBNAME}"
-engine = create_engine(conn_str)
+def push_parquet_chunks(parquet_path, table_name):
+    parquet_iter = pd.read_parquet(parquet_path, chunksize=CHUNK_SIZE)
 
-# ------------------------
-# Push a single Parquet in chunks
-# ------------------------
-def push_parquet_chunks(parquet_path: Path, table_name: str):
-    if not parquet_path.exists():
-        print(f"WARNING: Parquet file does not exist: {parquet_path}")
-        return
+    for i, df_chunk in enumerate(parquet_iter, 1):
+        # Convert WKB to Shapely geometries
+        df_chunk['geometry'] = df_chunk['geometry'].apply(wkb.loads)
+
+        # Create GeoDataFrame with correct CRS
+        gdf = gpd.GeoDataFrame(df_chunk, geometry='geometry', crs="EPSG:4326")
+
+        # Reproject to EPSG:5070
+        gdf = gdf.to_crs(TARGET_CRS)
+
+        # Push to Postgres (append chunks)
+        gdf.to_postgis(table_name, engine, if_exists='append', index=False)
+        print(f"Pushed chunk {i} ({len(gdf)} rows) to {table_name}")
+
+    # Create spatial index after all chunks loaded
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS {table_name}_geom_idx ON {table_name} USING GIST (geometry);"))
+        print(f"Spatial index created on {table_name}.geometry")
+
+def main():
+    parquet_path = "/Volumes/Tooth/FloodProject/02_Overture/Buildings/building_midwest.parquet"
+    table_name = "building_midwest"
 
     print(f"Streaming {table_name} from {parquet_path} in chunks of {CHUNK_SIZE} rows...")
-
-    pq_file = pq.ParquetFile(parquet_path)
-    first_chunk = True
-
-    for i, batch in enumerate(pq_file.iter_batches(batch_size=CHUNK_SIZE)):
-        df = batch.to_pandas()
-        gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")  # adjust CRS if needed
-        gdf = gdf.to_crs(EPSG_TARGET)
-
-        gdf.to_postgis(
-            name=table_name,
-            con=engine,
-            schema=SCHEMA,
-            if_exists="replace" if first_chunk else "append",
-            index=False
-        )
-
-        if first_chunk:
-            # Create spatial index
-            geom_col = gdf.geometry.name
-            index_name = f"{table_name}_{geom_col}_gist"
-            with engine.connect() as conn:
-                conn.execute(f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{SCHEMA}"."{table_name}" USING GIST ("{geom_col}");')
-            first_chunk = False
-
-        print(f"Chunk {i+1} written.")
-
-# ------------------------
-# Main loop
-# ------------------------
-def main():
-    parquet_files = list(PARQUET_DIR_BUILDINGS.glob("building_*.parquet"))
-    if not parquet_files:
-        print("No building Parquet files found.")
-        return
-
-    for parquet_path in parquet_files:
-        table_name = parquet_path.stem
-        push_parquet_chunks(parquet_path, table_name)
+    push_parquet_chunks(parquet_path, table_name)
+    print("Done!")
 
 if __name__ == "__main__":
     main()
