@@ -1,34 +1,39 @@
 #!/usr/bin/env python3.12
 """
-Convert Overture Maps Parquet files to Geopackage (GPKG) for PostGIS import.
+Convert Overture Maps Parquet files to GeoPackage, skipping macOS metadata files.
 """
 
-import geopandas as gpd
 import os
+import geopandas as gpd
 
-# Paths
-PARQUET_DIR_POIS = "/Volumes/Tooth/FloodProject/02_Overture/POIs"
+# Directories
 PARQUET_DIR_BUILDINGS = "/Volumes/Tooth/FloodProject/02_Overture/Buildings"
-GPKG_DIR = "/Volumes/Tooth/FloodProject/02_Overture/GPKG"
+PARQUET_DIR_POIS      = "/Volumes/Tooth/FloodProject/02_Overture/POIs"
+GPKG_DIR              = "/Volumes/Tooth/FloodProject/02_Overture/GPKG"
 
 os.makedirs(GPKG_DIR, exist_ok=True)
 
-# Helper function to convert Parquet to GPKG
 def convert_parquet_to_gpkg(parquet_path, output_dir):
-    gdf = gpd.read_parquet(parquet_path)
-    base_name = os.path.basename(parquet_path).replace(".parquet", ".gpkg")
-    output_file = os.path.join(output_dir, base_name)
-    gdf.to_file(output_file, driver="GPKG")
-    print(f"Converted {parquet_path} → {output_file}")
+    try:
+        gdf = gpd.read_parquet(parquet_path)
+        filename = os.path.splitext(os.path.basename(parquet_path))[0] + ".gpkg"
+        output_path = os.path.join(output_dir, filename)
+        gdf.to_file(output_path, driver="GPKG")
+        print(f"Converted {parquet_path} → {output_path}")
+    except Exception as e:
+        print(f"Error converting {parquet_path}: {e}")
 
-# Process POIs
-for f in os.listdir(PARQUET_DIR_POIS):
-    if f.endswith(".parquet"):
-        convert_parquet_to_gpkg(os.path.join(PARQUET_DIR_POIS, f), GPKG_DIR)
+# Convert all Parquet files in a directory, skipping macOS metadata files
+def convert_directory(parquet_dir, output_dir):
+    for f in os.listdir(parquet_dir):
+        if f.startswith("._") or f.startswith(".DS_Store"):
+            continue  # skip macOS metadata files
+        full_path = os.path.join(parquet_dir, f)
+        if os.path.isfile(full_path) and full_path.endswith(".parquet"):
+            convert_parquet_to_gpkg(full_path, output_dir)
 
-# Process Buildings (optional, if uncommented)
-# for f in os.listdir(PARQUET_DIR_BUILDINGS):
-#     if f.endswith(".parquet"):
-#         convert_parquet_to_gpkg(os.path.join(PARQUET_DIR_BUILDINGS, f), GPKG_DIR)
+# Uncomment if you want to convert buildings
+# convert_directory(PARQUET_DIR_BUILDINGS, GPKG_DIR)
 
-print("All Parquet files converted to GPKG.")
+# Convert POIs
+convert_directory(PARQUET_DIR_POIS, GPKG_DIR)
