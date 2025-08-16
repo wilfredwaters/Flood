@@ -5,8 +5,8 @@ from shapely import wkb
 from sqlalchemy import create_engine
 from sqlalchemy import text
 
-# PostgreSQL connection
-engine = create_engine("postgresql+psycopg2://user:password@localhost:5432/mydb")
+# PostgreSQL connection (Docker PostGIS)
+engine = create_engine("postgresql+psycopg2://docker:docker@localhost:25432/gis")
 
 CHUNK_SIZE = 25000
 TARGET_CRS = "EPSG:5070"
