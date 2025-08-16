@@ -12,8 +12,10 @@ from tqdm import tqdm
 
 # Paths
 POIS_DIR = "/Volumes/Tooth/FloodProject/02_Overture/POIs"
+BUILDINGS_DIR = "/Volumes/Tooth/FloodProject/02_Overture/Buildings"
 GPKG_DIR = "/Volumes/Tooth/FloodProject/02_Overture/GPKG"
 os.makedirs(POIS_DIR, exist_ok=True)
+os.makedirs(BUILDINGS_DIR, exist_ok=True)
 os.makedirs(GPKG_DIR, exist_ok=True)
 
 # Corrected CONUS regions bounding boxes
@@ -59,14 +61,19 @@ def convert_parquet_to_gpkg(parquet_path, gpkg_dir, epsg=5070):
 
 def main():
     for region_name, bbox in regions.items():
-        # POIs
-        poi_file = Path(POIS_DIR) / f"place_{region_name.lower()}.parquet"
-        download_overture("place", region_name, bbox, str(poi_file))
-        print("Debug check:", poi_file, "exists?", poi_file.exists())
-        convert_parquet_to_gpkg(str(poi_file), GPKG_DIR, epsg=5070)
+        # POIs (commented out since we only want buildings in Midwest)
+        # poi_file = Path(POIS_DIR) / f"place_{region_name.lower()}.parquet"
+        # download_overture("place", region_name, bbox, str(poi_file))
+        # convert_parquet_to_gpkg(str(poi_file), GPKG_DIR, epsg=5070)
 
-        # Buildings (commented out)
-        # building_file = Path(POIS_DIR) / f"building_{region_name.lower()}.parquet"
+        # Buildings (only Midwest uncommented)
+        if region_name == "Midwest":
+            building_file = Path(BUILDINGS_DIR) / f"building_{region_name.lower()}.parquet"
+            download_overture("building", region_name, bbox, str(building_file))
+            convert_parquet_to_gpkg(str(building_file), GPKG_DIR, epsg=5070)
+
+        # Other buildings (commented out)
+        # building_file = Path(BUILDINGS_DIR) / f"building_{region_name.lower()}.parquet"
         # download_overture("building", region_name, bbox, str(building_file))
         # convert_parquet_to_gpkg(str(building_file), GPKG_DIR, epsg=5070)
 
