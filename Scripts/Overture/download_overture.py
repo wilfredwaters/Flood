@@ -3,34 +3,28 @@
 Stream Overture Maps Buildings (and optionally POIs) from S3 into PostGIS.
 
 Features:
-- Full ETL for buildings (POIs optional, currently commented out)
-- First-run table creation (staging + main) based on Parquet schema
-- Restart-safe: resumes from unprocessed row groups
-- Local JSON log (etl_progress_log.json) and Postgres load_log table
-- Batch-level threading to avoid daemonic process issues
-- Indexes & constraints added after full load for efficiency
+- First-run table creation: staging + main tables.
+- Main table schema inherits from first staging table.
+- Incremental inserts: safe on restart or crash.
+- Checkpointing via a PostgreSQL `load_log` table (no JSON log).
+- Row-group processing with threads to avoid daemonic issues.
+- Works for both buildings and POIs (POI lines commented out).
+- Indexes/constraints added after full load for efficiency.
 """
 
 import time
-import json
 import pyarrow.parquet as pq
 import geopandas as gpd
 from shapely import wkb
 from sqlalchemy import create_engine, text
-from multiprocessing import Pool
-from tqdm import tqdm
-from functools import partial
-import s3fs
 from concurrent.futures import ThreadPoolExecutor
+import s3fs
 import pyarrow.fs as fs
 
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
-
 MAIN_TABLE_BUILDINGS = "building_usa"
-# MAIN_TABLE_POIS = "place_usa"  # Uncomment if processing POIs
-
-LOG_PATH = "etl_progress_log.json"
+# MAIN_TABLE_POIS = "poi_usa"  # Uncomment if processing POIs
 
 NUM_WORKERS = 4            # Global row group pool
 BATCH_WORKERS = 4          # Batch-level parallelism per row group
@@ -44,105 +38,44 @@ USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
 BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building/*"
 # POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"  # Uncomment if needed
 
-# Toggle for testing: only process the first row group of the first file
 TEST_FIRST_ROW_GROUP_ONLY = True
 
 # ----------------------- POSTGIS ENGINE -----------------------
 engine = create_engine(POSTGIS_URL)
 
-# ----------------------- LOG UTILITIES -----------------------
-def load_log():
-    """Load local JSON progress log."""
-    try:
-        with open(LOG_PATH, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-def update_log(log):
-    """Write local JSON progress log."""
-    with open(LOG_PATH, "w") as f:
-        json.dump(log, f, indent=2)
-
-def row_group_already_done(log, parquet_path, row_group_idx):
-    """Check if row group has been successfully processed."""
-    return log.get(parquet_path, {}).get(str(row_group_idx), False)
-
-# ----------------------- LOAD LOG TABLE -----------------------
+# ----------------------- CHECKPOINTING -----------------------
 def ensure_load_log_table():
-    """Ensure Postgres table to track processed row groups exists."""
+    """Create the load_log table if it doesn't exist."""
     with engine.begin() as conn:
         conn.execute(text("""
         CREATE TABLE IF NOT EXISTS load_log (
-            parquet_path TEXT NOT NULL,
+            parquet_url TEXT NOT NULL,
             row_group_idx INT NOT NULL,
-            main_table TEXT NOT NULL,
-            PRIMARY KEY(parquet_path, row_group_idx, main_table)
+            processed_at TIMESTAMP DEFAULT now(),
+            PRIMARY KEY(parquet_url, row_group_idx)
         );
         """))
 
-def mark_row_group_done(parquet_path, row_group_idx, main_table):
-    """Mark a row group as done in Postgres load_log table."""
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO load_log(parquet_path, row_group_idx, main_table)
-            VALUES (:parquet_path, :row_group_idx, :main_table)
-            ON CONFLICT DO NOTHING;
-        """), {"parquet_path": parquet_path, "row_group_idx": row_group_idx, "main_table": main_table})
+def row_group_already_done(parquet_url, row_group_idx):
+    """Check if the row group has been processed already."""
+    with engine.connect() as conn:
+        result = conn.execute(
+            text("SELECT 1 FROM load_log WHERE parquet_url = :url AND row_group_idx = :rg"),
+            {"url": parquet_url, "rg": row_group_idx}
+        ).first()
+        return result is not None
 
-def is_row_group_done(parquet_path, row_group_idx, main_table):
-    """Check if row group is done in Postgres load_log table."""
+def mark_row_group_done(parquet_url, row_group_idx):
+    """Mark the row group as processed in load_log."""
     with engine.begin() as conn:
-        res = conn.execute(text("""
-            SELECT 1 FROM load_log 
-            WHERE parquet_path=:parquet_path AND row_group_idx=:row_group_idx AND main_table=:main_table
-        """), {"parquet_path": parquet_path, "row_group_idx": row_group_idx, "main_table": main_table})
-        return res.first() is not None
-
-# ----------------------- TABLE CREATION -----------------------
-def create_staging_table_from_parquet(parquet_path, staging_table):
-    """Create a staging table based on the Parquet file schema."""
-    filesystem, path = fs.FileSystem.from_uri(parquet_path)
-    pf = pq.ParquetFile(path, filesystem=filesystem)
-    schema = pf.schema_arrow
-    cols = []
-    for i, name in enumerate(schema.names):
-        pa_type = schema.types[i]
-        if pa_type == "string":
-            pg_type = "TEXT"
-        elif pa_type == "int64":
-            pg_type = "BIGINT"
-        elif pa_type == "double":
-            pg_type = "DOUBLE PRECISION"
-        elif pa_type == "bool":
-            pg_type = "BOOLEAN"
-        elif pa_type == "binary":
-            pg_type = "BYTEA"
-        else:
-            pg_type = "TEXT"
-        cols.append(f"{name} {pg_type}")
-    # Ensure geometry column exists
-    if "geometry" not in schema.names:
-        cols.append("geometry GEOMETRY")
-    cols_sql = ", ".join(cols)
-    with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
-        conn.execute(text(f"CREATE TABLE {staging_table} ({cols_sql});"))
-
-def create_main_table_from_staging(staging_table, main_table):
-    """Create the main table based on the first staging table schema."""
-    with engine.begin() as conn:
-        res = conn.execute(text(f"""
-            SELECT column_name, data_type
-            FROM information_schema.columns
-            WHERE table_name='{staging_table}';
-        """))
-        cols_sql = ", ".join([f"{row['column_name']} {row['data_type']}" for row in res])
-        conn.execute(text(f"CREATE TABLE IF NOT EXISTS {main_table} ({cols_sql});"))
+        conn.execute(
+            text("INSERT INTO load_log(parquet_url, row_group_idx) VALUES(:url, :rg) ON CONFLICT DO NOTHING;"),
+            {"url": parquet_url, "rg": row_group_idx}
+        )
 
 # ----------------------- INDEX CREATION -----------------------
 def create_indexes(main_table):
-    """Create indexes on the main table after full load."""
+    """Create indexes for faster spatial and attribute queries."""
     with engine.begin() as conn:
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS {main_table}_geom_idx ON {main_table} USING GIST (geometry);"))
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS {main_table}_subtype_idx ON {main_table} (subtype);"))
@@ -151,7 +84,7 @@ def create_indexes(main_table):
 
 # ----------------------- BATCH PROCESSING -----------------------
 def process_batch(batch, staging_table):
-    """Process a batch of rows into a staging table."""
+    """Process a single Arrow batch into PostGIS staging table."""
     df = batch.to_pandas()
     if df.empty:
         return
@@ -174,40 +107,46 @@ def process_row_group_batches(parquet_path, row_group_idx, staging_table):
 
 # ----------------------- ROW GROUP PROCESSING -----------------------
 def process_row_group_task(task):
-    """Process a single row group: create staging table, load data, then insert into main table."""
+    """Process a single row group: create staging, insert into main, checkpoint."""
     parquet_url, row_group_idx, main_table = task
     staging_table = f"{main_table}_staging_{row_group_idx}"
-    
-    if is_row_group_done(parquet_url, row_group_idx, main_table):
+
+    if row_group_already_done(parquet_url, row_group_idx):
         return (parquet_url, row_group_idx, True)
 
     attempts = 0
     while attempts < RETRIES:
         try:
-            # First-run table creation
-            if row_group_idx == 0:
-                create_staging_table_from_parquet(parquet_url, staging_table)
-                create_main_table_from_staging(staging_table, main_table)
-            else:
-                create_staging_table_from_parquet(parquet_url, staging_table)
-
-            process_row_group_batches(parquet_url, row_group_idx, staging_table)
-
+            # Drop staging table if exists
             with engine.begin() as conn:
-                conn.execute(text(f"INSERT INTO {main_table} SELECT * FROM {staging_table};"))
                 conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
 
-            mark_row_group_done(parquet_url, row_group_idx, main_table)
+            # Create staging table from Parquet
+            process_row_group_batches(parquet_url, row_group_idx, staging_table)
+
+            # Create main table from first staging table if it does not exist
+            with engine.begin() as conn:
+                if not conn.execute(
+                    text(f"SELECT to_regclass('{main_table}');")
+                ).scalar():
+                    conn.execute(text(f"CREATE TABLE {main_table} AS TABLE {staging_table} WITH NO DATA;"))
+
+            # Insert into main table
+            with engine.begin() as conn:
+                conn.execute(text(f"INSERT INTO {main_table} SELECT * FROM {staging_table};"))
+
+            mark_row_group_done(parquet_url, row_group_idx)
             return (parquet_url, row_group_idx, True)
         except Exception as e:
             print(f"Error processing row group {row_group_idx} from {parquet_url}: {e}")
             attempts += 1
             time.sleep(RETRY_DELAY)
+
     return (parquet_url, row_group_idx, False)
 
-# ----------------------- MAIN STREAMING FUNCTION -----------------------
-def collect_row_group_tasks(parquet_patterns, log):
-    """List row group tasks from S3 based on patterns, skipping completed ones."""
+# ----------------------- TASK COLLECTION -----------------------
+def collect_row_group_tasks(parquet_patterns):
+    """List all row-group tasks from S3, skipping already-processed ones."""
     s3 = s3fs.S3FileSystem(anon=True)
     tasks = []
     for pattern, main_table in parquet_patterns:
@@ -219,16 +158,15 @@ def collect_row_group_tasks(parquet_patterns, log):
             parquet_url = f"s3://{file}" if not file.startswith("s3://") else file
             pf = pq.ParquetFile(parquet_url, filesystem=s3)
             for rg_idx in range(pf.num_row_groups):
-                if not row_group_already_done(log, parquet_url, rg_idx):
+                if not row_group_already_done(parquet_url, rg_idx):
                     tasks.append((parquet_url, rg_idx, main_table))
                     if TEST_FIRST_ROW_GROUP_ONLY:
-                        return tasks
+                        return tasks  # only first row group for testing
     return tasks
 
+# ----------------------- MAIN STREAMING FUNCTION -----------------------
 def main():
-    """Main ETL orchestration: collect tasks, process row groups, update logs, create indexes."""
     overall_start = time.time()
-    log = load_log()
     ensure_load_log_table()
 
     jobs = [
@@ -236,19 +174,22 @@ def main():
         # (POIS_S3_PATTERN, MAIN_TABLE_POIS),  # Uncomment if needed
     ]
 
-    tasks = collect_row_group_tasks(jobs, log)
+    tasks = collect_row_group_tasks(jobs)
     print(f"Total row-group tasks to process: {len(tasks)}")
 
     if not tasks:
         print("No tasks found. Exiting.")
         return
 
+    from multiprocessing import Pool
+    from tqdm import tqdm
+
     with Pool(NUM_WORKERS) as pool:
-        for parquet_url, rg_idx, success in tqdm(pool.imap_unordered(process_row_group_task, tasks),
-                                                 total=len(tasks),
-                                                 desc="All RowGroups"):
-            log.setdefault(parquet_url, {})[str(rg_idx)] = success
-            update_log(log)
+        for parquet_url, rg_idx, success in tqdm(
+                pool.imap_unordered(process_row_group_task, tasks),
+                total=len(tasks),
+                desc="All RowGroups"
+        ):
             if not success:
                 print(f"Row group {rg_idx} from {parquet_url} failed after retries.")
 
@@ -258,6 +199,7 @@ def main():
 
     overall_end = time.time()
     print(f"Total ETL runtime: {overall_end - overall_start:.1f} sec")
+
 
 if __name__ == "__main__":
     main()
