@@ -18,6 +18,11 @@ from multiprocessing import Pool
 from tqdm import tqdm
 from functools import partial
 
+# ----------------------- ETL MODE TOGGLE -----------------------
+# True  = process only the first row group (for testing)
+# False = process all row groups within the bounding box
+TEST_FIRST_ROW_GROUP_ONLY = True
+
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
 MAIN_TABLE_BUILDINGS = "building_usa"
@@ -112,6 +117,8 @@ def collect_row_group_tasks(parquet_urls, log):
         for rg_idx in range(pf.num_row_groups):
             if not row_group_already_done(log, parquet_url, rg_idx):
                 tasks.append((parquet_url, rg_idx, main_table))
+                if TEST_FIRST_ROW_GROUP_ONLY:
+                    return tasks  # stop after first row group
     return tasks
 
 def main():
