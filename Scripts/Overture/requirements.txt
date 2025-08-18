@@ -1,22 +1,16 @@
-# Core libraries
-pandas==2.1.2
-geopandas==1.2.1
-fiona==1.9.3
-gdal==3.6.3
-pyarrow==12.0.1
-shapely==2.1.3
-s3fs==2023.11.0
-boto3==1.30.19
+# Core data and spatial libraries
+pandas
+geopandas
+pyarrow
+shapely
 
-# Database
-sqlalchemy==2.0.43
-psycopg2-binary==2.9.10
+# AWS S3 and filesystem handling
+# boto3 is automatically installed as a dependency of s3fs
+s3fs
 
-# S3 / streaming
-fsspec[s3]==2023.11.0
+# Database connection
+sqlalchemy
+psycopg2-binary
 
 # Progress bars
-tqdm==4.71.1
-
-# Optional but recommended for parallel processing
-multiprocessing-logging==0.1.4
+tqdm
