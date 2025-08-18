@@ -18,6 +18,7 @@ from tqdm import tqdm
 from functools import partial
 import s3fs
 from concurrent.futures import ThreadPoolExecutor
+import pyarrow.fs as fs
 
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
