@@ -17,6 +17,7 @@ from multiprocessing import Pool
 from tqdm import tqdm
 from functools import partial
 import s3fs
+from concurrent.futures import ThreadPoolExecutor
 
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
@@ -79,10 +80,13 @@ def process_batch(batch, staging_table):
     gdf.to_postgis(staging_table, engine, if_exists='append', index=False)
 
 def process_row_group_batches(parquet_path, row_group_idx, staging_table):
-    pf = pq.ParquetFile(parquet_path)
+    """Process all batches in a row group using threads to avoid daemonic issues."""
+    filesystem, path = fs.FileSystem.from_uri(parquet_path)
+    pf = pq.ParquetFile(path, filesystem=filesystem)
     batches = list(pf.iter_batches(batch_size=BATCH_SIZE, row_groups=[row_group_idx]))
-    with Pool(BATCH_WORKERS) as batch_pool:
-        batch_pool.map(partial(process_batch, staging_table=staging_table), batches)
+    with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
+        executor.map(lambda batch: process_batch(batch, staging_table), batches)
+
 
 # ----------------------- ROW GROUP PROCESSING -----------------------
 def process_row_group_task(task):
