@@ -1,28 +1,36 @@
-#!/usr/bin/env python3.12
+#!/usr/bin/env python3.13
 """
-Stream Overture Maps Buildings (and optionally POIs) from S3 into PostGIS.
-Supports:
-- Full ETL
-- Single row-group test toggle
-No local Parquet files.
+Stream Overture Maps Buildings and POIs from S3 into PostGIS.
+
+Features:
+- Full ETL for Buildings and POIs
+- Streaming from S3 without saving local Parquet
+- Row group batching with thread-level parallelism
+- Staging tables per row group for safe inserts
+- Automatic creation of main tables if missing
+- Schema inferred from Parquet files
+- Optional toggle to process only the first row group for testing
 """
 
 import time
 import json
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Pool
+
 import pyarrow.parquet as pq
+import pyarrow as pa
 import geopandas as gpd
 from shapely import wkb
 from sqlalchemy import create_engine, text
-from multiprocessing import Pool
-from tqdm import tqdm
-from functools import partial
 import s3fs
-from concurrent.futures import ThreadPoolExecutor
 import pyarrow.fs as fs
+from tqdm import tqdm
 
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
 MAIN_TABLE_BUILDINGS = "building_usa"
+MAIN_TABLE_POIS = "poi_usa"
 LOG_PATH = "etl_progress_log.json"
 
 NUM_WORKERS = 4            # Global row group pool
@@ -35,7 +43,7 @@ USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
 
 # S3 Parquet URL patterns
 BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building/*"
-# POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"  # Uncomment if needed
+POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"
 
 # Toggle for testing: only process the first row group of the first file
 TEST_FIRST_ROW_GROUP_ONLY = True
@@ -67,16 +75,28 @@ def create_indexes(main_table):
     print(f"Indexes created on {main_table}.")
 
 # ----------------------- TABLE CREATION -----------------------
-def ensure_main_table_exists(main_table):
+def create_table_from_parquet(main_table, parquet_file, filesystem):
+    """Create PostGIS table with schema inferred from Parquet."""
+    pf = pq.ParquetFile(parquet_file, filesystem=filesystem)
+    schema = pf.schema_arrow
+    columns = []
+    for field in schema:
+        if pa.types.is_integer(field.type):
+            col_type = "BIGINT"
+        elif pa.types.is_floating(field.type):
+            col_type = "DOUBLE PRECISION"
+        elif pa.types.is_string(field.type):
+            col_type = "TEXT"
+        elif pa.types.is_boolean(field.type):
+            col_type = "BOOLEAN"
+        elif field.name == "geometry":
+            col_type = "GEOMETRY"
+        else:
+            col_type = "TEXT"
+        columns.append(f"{field.name} {col_type}")
+    create_stmt = f"CREATE TABLE IF NOT EXISTS {main_table} ({', '.join(columns)});"
     with engine.begin() as conn:
-        conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS {main_table} (
-                id SERIAL PRIMARY KEY,
-                class TEXT,
-                subtype TEXT,
-                geometry GEOMETRY
-            );
-        """))
+        conn.execute(text(create_stmt))
 
 # ----------------------- BATCH PROCESSING -----------------------
 def process_batch(batch, staging_table):
@@ -104,12 +124,16 @@ def process_row_group_batches(parquet_path, row_group_idx, staging_table):
 def process_row_group_task(task):
     parquet_url, row_group_idx, main_table = task
     staging_table = f"{main_table}_staging_{row_group_idx}"
-    ensure_main_table_exists(main_table)
     attempts = 0
+    filesystem, path = fs.FileSystem.from_uri(parquet_url)
+    # Ensure main table exists
+    create_table_from_parquet(main_table, path, filesystem)
     while attempts < RETRIES:
         try:
             with engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
+            # Create staging table with same schema as main
+            create_table_from_parquet(staging_table, path, filesystem)
             process_row_group_batches(parquet_url, row_group_idx, staging_table)
             with engine.begin() as conn:
                 conn.execute(text(f"INSERT INTO {main_table} SELECT * FROM {staging_table};"))
@@ -146,7 +170,7 @@ def main():
 
     jobs = [
         (BUILDINGS_S3_PATTERN, MAIN_TABLE_BUILDINGS),
-        # (POIS_S3_PATTERN, MAIN_TABLE_POIS),  # Uncomment if needed
+        (POIS_S3_PATTERN, MAIN_TABLE_POIS),
     ]
 
     tasks = collect_row_group_tasks(jobs, log)
@@ -165,7 +189,7 @@ def main():
             if not success:
                 print(f"Row group {rg_idx} from {parquet_url} failed after retries.")
 
-    # Create indexes
+    # Create indexes on main tables
     for _, main_table in jobs:
         create_indexes(main_table)
 
