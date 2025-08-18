@@ -1,17 +1,15 @@
-#!/usr/bin/env python3.13
+#!/usr/bin/env python3.12
 """
 Stream Overture Maps Buildings (and optionally POIs) from S3 into PostGIS.
-Features:
-- Parallel processing (row group + batch level)
-- No local Parquet storage
-- Atomic row group insertion
-- Resume support via JSON log
+Supports:
+- Full ETL
+- Single row-group test toggle
+No local Parquet files.
 """
 
 import time
 import json
 import pyarrow.parquet as pq
-import pyarrow.fs as fs
 import geopandas as gpd
 from shapely import wkb
 from sqlalchemy import create_engine, text
@@ -19,13 +17,12 @@ from multiprocessing import Pool
 from tqdm import tqdm
 from functools import partial
 import s3fs
-import glob
 
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
 MAIN_TABLE_BUILDINGS = "building_usa"
-# MAIN_TABLE_POIS = "poi_usa"  # Uncomment if needed
 LOG_PATH = "etl_progress_log.json"
+
 NUM_WORKERS = 4            # Global row group pool
 BATCH_WORKERS = 4          # Batch-level parallelism per row group
 BATCH_SIZE = 100_000
@@ -34,12 +31,12 @@ RETRIES = 3
 RETRY_DELAY = 5  # seconds
 USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
 
-# ----------------------- TOGGLE -----------------------
-RUN_ONLY_FIRST_ROW_GROUP = True  # True = first row group only, False = full area
-
 # S3 Parquet URL patterns
 BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building/*"
-# POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"
+# POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"  # Uncomment if needed
+
+# Toggle for testing: only process the first row group of the first file
+TEST_FIRST_ROW_GROUP_ONLY = False
 
 # ----------------------- POSTGIS ENGINE -----------------------
 engine = create_engine(POSTGIS_URL)
@@ -82,13 +79,12 @@ def process_batch(batch, staging_table):
     gdf.to_postgis(staging_table, engine, if_exists='append', index=False)
 
 def process_row_group_batches(parquet_path, row_group_idx, staging_table):
-    filesystem, path = fs.FileSystem.from_uri(parquet_path)
-    pf = pq.ParquetFile(path, filesystem=filesystem)
+    pf = pq.ParquetFile(parquet_path)
     batches = list(pf.iter_batches(batch_size=BATCH_SIZE, row_groups=[row_group_idx]))
     with Pool(BATCH_WORKERS) as batch_pool:
         batch_pool.map(partial(process_batch, staging_table=staging_table), batches)
 
-# ----------------------- ROW GROUP TASK -----------------------
+# ----------------------- ROW GROUP PROCESSING -----------------------
 def process_row_group_task(task):
     parquet_url, row_group_idx, main_table = task
     staging_table = f"{main_table}_staging_{row_group_idx}"
@@ -108,26 +104,25 @@ def process_row_group_task(task):
             time.sleep(RETRY_DELAY)
     return (parquet_url, row_group_idx, False)
 
-# ----------------------- TASK COLLECTION -----------------------
-def list_s3_files(pattern):
-    s3 = s3fs.S3FileSystem()
-    return s3.glob(pattern)
-
+# ----------------------- MAIN STREAMING FUNCTION -----------------------
 def collect_row_group_tasks(parquet_patterns, log):
+    s3 = s3fs.S3FileSystem(anon=True)
     tasks = []
     for pattern, main_table in parquet_patterns:
-        files = list_s3_files(pattern)
-        for parquet_url in files:
-            filesystem, path = fs.FileSystem.from_uri(parquet_url)
-            pf = pq.ParquetFile(path, filesystem=filesystem)
+        files = s3.glob(pattern)
+        if not files:
+            print(f"No files found for pattern {pattern}")
+            continue
+        for file in files:
+            parquet_url = f"s3://{file}" if not file.startswith("s3://") else file
+            pf = pq.ParquetFile(parquet_url, filesystem=s3)
             for rg_idx in range(pf.num_row_groups):
                 if not row_group_already_done(log, parquet_url, rg_idx):
                     tasks.append((parquet_url, rg_idx, main_table))
-                    if RUN_ONLY_FIRST_ROW_GROUP:
-                        return tasks
+                    if TEST_FIRST_ROW_GROUP_ONLY:
+                        return tasks  # only first row group
     return tasks
 
-# ----------------------- MAIN FUNCTION -----------------------
 def main():
     overall_start = time.time()
     log = load_log()
@@ -140,6 +135,10 @@ def main():
     tasks = collect_row_group_tasks(jobs, log)
     print(f"Total row-group tasks to process: {len(tasks)}")
 
+    if not tasks:
+        print("No tasks found. Exiting.")
+        return
+
     with Pool(NUM_WORKERS) as pool:
         for parquet_url, rg_idx, success in tqdm(pool.imap_unordered(process_row_group_task, tasks),
                                                  total=len(tasks),
@@ -149,6 +148,7 @@ def main():
             if not success:
                 print(f"Row group {rg_idx} from {parquet_url} failed after retries.")
 
+    # Create indexes
     for _, main_table in jobs:
         create_indexes(main_table)
 
