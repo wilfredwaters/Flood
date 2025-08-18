@@ -38,7 +38,7 @@ BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=b
 # POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"  # Uncomment if needed
 
 # Toggle for testing: only process the first row group of the first file
-TEST_FIRST_ROW_GROUP_ONLY = False
+TEST_FIRST_ROW_GROUP_ONLY = True
 
 # ----------------------- POSTGIS ENGINE -----------------------
 engine = create_engine(POSTGIS_URL)
@@ -66,6 +66,18 @@ def create_indexes(main_table):
         conn.execute(text(f"CREATE INDEX IF NOT EXISTS {main_table}_class_idx ON {main_table} (class);"))
     print(f"Indexes created on {main_table}.")
 
+# ----------------------- TABLE CREATION -----------------------
+def ensure_main_table_exists(main_table):
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {main_table} (
+                id SERIAL PRIMARY KEY,
+                class TEXT,
+                subtype TEXT,
+                geometry GEOMETRY
+            );
+        """))
+
 # ----------------------- BATCH PROCESSING -----------------------
 def process_batch(batch, staging_table):
     df = batch.to_pandas()
@@ -88,11 +100,11 @@ def process_row_group_batches(parquet_path, row_group_idx, staging_table):
     with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
         executor.map(lambda batch: process_batch(batch, staging_table), batches)
 
-
 # ----------------------- ROW GROUP PROCESSING -----------------------
 def process_row_group_task(task):
     parquet_url, row_group_idx, main_table = task
     staging_table = f"{main_table}_staging_{row_group_idx}"
+    ensure_main_table_exists(main_table)
     attempts = 0
     while attempts < RETRIES:
         try:
