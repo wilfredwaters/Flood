@@ -11,6 +11,7 @@ Features:
 - All operations for a row group are performed in a single, atomic transaction.
 - Correct on-the-fly CRS transformation using PostGIS.
 - Efficient, centralized S3 filesystem handling.
+- Optional toggle to stop after the first successful data insert.
 """
 
 import time
@@ -27,30 +28,29 @@ POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
 MAIN_TABLE_BUILDINGS = "building_usa"
 # MAIN_TABLE_POIS = "poi_usa"  # Uncomment if processing POIs
 
-NUM_WORKERS = 4            # Global row group pool
-BATCH_WORKERS = 4          # Batch-level parallelism per row group
+NUM_WORKERS = 4
+BATCH_WORKERS = 4
 BATCH_SIZE = 100_000
-RETRIES = 3
-RETRY_DELAY = 5  # seconds
-USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
-
-# CRS and SRID configuration
 TARGET_CRS = "EPSG:5070"
-# <<<<<<< START OF FIX >>>>>>>
-# PostGIS expects an integer SRID, not the full "EPSG:xxxx" string
 TARGET_SRID = TARGET_CRS.split(':')[-1]
-# <<<<<<< END OF FIX >>>>>>>
+RETRIES = 3
+RETRY_DELAY = 5
+USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
 
 # S3 Parquet URL patterns
 BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building/*"
-# POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"  # Uncomment if needed
+# POIS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place/*"
 
-TEST_FIRST_ROW_GROUP_ONLY = True
+# <<<<<<< START OF NEW FEATURE >>>>>>>
+# Set to True to run the script only until the first non-empty row group is successfully processed.
+STOP_AFTER_FIRST_SUCCESS = True
+# Set to False for a full production run.
+# <<<<<<< END OF NEW FEATURE >>>>>>>
 
 # ----------------------- POSTGIS ENGINE -----------------------
 engine = create_engine(POSTGIS_URL, pool_size=NUM_WORKERS + BATCH_WORKERS)
 
-# ----------------------- CHECKPOINTING -----------------------
+# ----------------------- CHECKPOINTING & LOGGING -----------------------
 def ensure_load_log_table():
     with engine.begin() as conn:
         conn.execute(text("""
@@ -96,138 +96,104 @@ def create_staging_table(parquet_file, staging_table, conn):
     for field in schema:
         col_name = field.name
         col_type_str = str(field.type).lower()
-        
         pg_type = "TEXT"
         if 'binary' in col_type_str: pg_type = "BYTEA"
         elif 'int64' in col_type_str: pg_type = "BIGINT"
         elif 'int32' in col_type_str: pg_type = "INTEGER"
         elif 'float64' in col_type_str: pg_type = "DOUBLE PRECISION"
         elif 'bool' in col_type_str: pg_type = "BOOLEAN"
-        
-        if col_name == 'geometry':
-            pg_type = "GEOMETRY(Geometry, 4326)"
-
+        if col_name == 'geometry': pg_type = f"GEOMETRY(Geometry, 4326)"
         columns.append(f"{col_name} {pg_type}")
-
     create_sql = f"CREATE TABLE {staging_table} ({', '.join(columns)});"
     conn.execute(text(create_sql))
-    print(f"[DEBUG] Created staging table {staging_table}")
 
-def process_batch(batch, staging_table, conn):
+def process_batch(batch, conn):
     df = batch.to_pandas()
-    if df.empty: return
-
+    if df.empty: return None
     df['geometry'] = df['geometry'].apply(wkb.loads)
     gdf = gpd.GeoDataFrame(df, geometry='geometry', crs="EPSG:4326")
-    
     minx, miny, maxx, maxy = USA_BBOX
     gdf = gdf.cx[minx:maxx, miny:maxy]
-    if gdf.empty: return
-
-    gdf.to_postgis(staging_table, conn, if_exists='append', index=False)
+    return gdf if not gdf.empty else None
 
 def process_row_group_batches(parquet_file, row_group_idx, staging_table, conn):
     batches = list(parquet_file.iter_batches(batch_size=BATCH_SIZE, row_groups=[row_group_idx]))
-    print(f"[DEBUG] Processing {len(batches)} batches for row group {row_group_idx}.")
+    total_rows = 0
     with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as executor:
-        executor.map(lambda batch: process_batch(batch, staging_table, conn), batches)
+        results = executor.map(process_batch, batches, [conn] * len(batches))
+        for gdf in results:
+            if gdf is not None:
+                total_rows += len(gdf)
+                gdf.to_postgis(staging_table, conn, if_exists='append', index=False)
+    return total_rows
 
 # ----------------------- ROW GROUP PROCESSING -----------------------
 def process_row_group_task(task, s3fs_instance):
     parquet_url, row_group_idx, main_table = task
     staging_table = f"{main_table}_staging_{row_group_idx}"
 
-    if not TEST_FIRST_ROW_GROUP_ONLY and row_group_already_done(parquet_url, row_group_idx):
-        print(f"[DEBUG] Row group {row_group_idx} already processed, skipping.")
-        return True
+    if row_group_already_done(parquet_url, row_group_idx):
+        return (True, 0) # Success, but 0 rows processed by this run
 
     attempts = 0
     while attempts < RETRIES:
         try:
             parquet_file = pq.ParquetFile(parquet_url, filesystem=s3fs_instance)
-            
+            row_count = 0
             with engine.begin() as conn:
                 conn.execute(text(f"DROP TABLE IF EXISTS {staging_table};"))
                 create_staging_table(parquet_file, staging_table, conn)
-                process_row_group_batches(parquet_file, row_group_idx, staging_table, conn)
+                row_count = process_row_group_batches(parquet_file, row_group_idx, staging_table, conn)
 
-                exists = conn.execute(text(f"SELECT to_regclass('{main_table}');")).scalar()
-                if not exists:
-                    print(f"[DEBUG] Main table {main_table} does not exist, creating from {staging_table} ...")
-                    conn.execute(text(f"CREATE TABLE {main_table} AS TABLE {staging_table} WITH NO DATA;"))
-                    # <<<<<<< START OF FIX >>>>>>>
-                    # Use the integer SRID for the ALTER TABLE command
-                    conn.execute(text(f"ALTER TABLE {main_table} ALTER COLUMN geometry TYPE geometry(Geometry, {TARGET_SRID});"))
-                    # <<<<<<< END OF FIX >>>>>>>
-
-                staging_cols_res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{staging_table}' ORDER BY ordinal_position;"))
-                staging_cols = [row[0] for row in staging_cols_res]
-                
-                select_expressions = []
-                for col in staging_cols:
-                    if col == 'geometry':
-                        # <<<<<<< START OF FIX >>>>>>>
-                        # Use the integer SRID for the ST_Transform function
-                        select_expressions.append(f"ST_Transform(geometry, {TARGET_SRID})")
-                        # <<<<<<< END OF FIX >>>>>>>
-                    else:
-                        select_expressions.append(col)
-                
-                insert_sql = f"INSERT INTO {main_table} ({', '.join(staging_cols)}) SELECT {', '.join(select_expressions)} FROM {staging_table};"
-                conn.execute(text(insert_sql))
-                print(f"[DEBUG] Row group {row_group_idx} inserted into main table {main_table}.")
-
+                if row_count > 0:
+                    exists = conn.execute(text(f"SELECT to_regclass('{main_table}');")).scalar()
+                    if not exists:
+                        conn.execute(text(f"CREATE TABLE {main_table} AS TABLE {staging_table} WITH NO DATA;"))
+                        conn.execute(text(f"ALTER TABLE {main_table} ALTER COLUMN geometry TYPE geometry(Geometry, {TARGET_SRID});"))
+                    
+                    staging_cols_res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{staging_table}' ORDER BY ordinal_position;"))
+                    staging_cols = [row[0] for row in staging_cols_res]
+                    select_expressions = [f"ST_Transform(geometry, {TARGET_SRID})" if col == 'geometry' else col for col in staging_cols]
+                    insert_sql = f"INSERT INTO {main_table} ({', '.join(staging_cols)}) SELECT {', '.join(select_expressions)} FROM {staging_table};"
+                    conn.execute(text(insert_sql))
+            
             mark_row_group_done(parquet_url, row_group_idx)
-            print(f"[DEBUG] Row group {row_group_idx} marked as done.")
-            return True
+            return (True, row_count)
         except Exception as e:
             print(f"[ERROR] Error processing row group {row_group_idx} from {parquet_url}: {e}")
             attempts += 1
             time.sleep(RETRY_DELAY)
-    return False
+    return (False, 0)
 
 # ----------------------- TASK COLLECTION -----------------------
 def collect_row_group_tasks(parquet_patterns, s3fs_instance):
     tasks = []
     for pattern, main_table in parquet_patterns:
-        files = s3fs_instance.glob(pattern)
-        if not files:
-            print(f"[DEBUG] No files found for pattern {pattern}")
-            continue
-        
-        for file_path in files:
-            parquet_url = f"s3://{file_path}"
-            try:
+        try:
+            files = s3fs_instance.glob(pattern)
+            if not files: continue
+            for file_path in files:
+                parquet_url = f"s3://{file_path}"
                 pf = pq.ParquetFile(parquet_url, filesystem=s3fs_instance)
                 for rg_idx in range(pf.num_row_groups):
-                    if TEST_FIRST_ROW_GROUP_ONLY:
-                        print("[INFO] TEST_FIRST_ROW_GROUP_ONLY is True. Processing only one task.")
-                        return [(parquet_url, rg_idx, main_table)]
-                    
                     if not row_group_already_done(parquet_url, rg_idx):
                         tasks.append((parquet_url, rg_idx, main_table))
-            except Exception as e:
-                print(f"[WARNING] Could not read metadata from {parquet_url}. Skipping. Error: {e}")
+        except Exception as e:
+            print(f"[WARNING] Could not list or read files for pattern {pattern}. Error: {e}")
     return tasks
 
 # ----------------------- MAIN STREAMING FUNCTION -----------------------
 def main():
     overall_start = time.time()
     ensure_load_log_table()
-
     s3 = s3fs.S3FileSystem(anon=True)
 
-    jobs = [
-        (BUILDINGS_S3_PATTERN, MAIN_TABLE_BUILDINGS),
-        # (POIS_S3_PATTERN, MAIN_TABLE_POIS),
-    ]
+    jobs = [(BUILDINGS_S3_PATTERN, MAIN_TABLE_BUILDINGS)]
+    # jobs.append((POIS_S3_PATTERN, MAIN_TABLE_POIS))
 
     tasks = collect_row_group_tasks(jobs, s3)
     print(f"[INFO] Total row-group tasks to process: {len(tasks)}")
-
-    if not tasks:
-        print("[INFO] No new tasks to process. Exiting.")
-        return
+    if not tasks: return
 
     from multiprocessing import Pool
     from functools import partial
@@ -235,12 +201,15 @@ def main():
     worker_func = partial(process_row_group_task, s3fs_instance=s3)
 
     with Pool(NUM_WORKERS) as pool:
-        for _ in tqdm(
-                pool.imap_unordered(worker_func, tasks),
-                total=len(tasks),
-                desc="All RowGroups"
-        ):
-            pass
+        for success, row_count in tqdm(pool.imap_unordered(worker_func, tasks), total=len(tasks), desc="All RowGroups"):
+            if success and row_count > 0:
+                print(f"[INFO] Successfully processed {row_count} rows.")
+                if STOP_AFTER_FIRST_SUCCESS:
+                    print("[INFO] STOP_AFTER_FIRST_SUCCESS is True. Halting processing.")
+                    pool.terminate() # Stop all worker processes immediately
+                    break
+            elif not success:
+                print(f"[ERROR] A task failed after all retries.")
 
     print("[INFO] Data loading complete. Creating indexes...")
     for _, main_table in jobs:
