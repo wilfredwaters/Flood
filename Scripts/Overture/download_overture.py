@@ -1,21 +1,22 @@
 #!/usr/bin/env python3.13
 """
-Stream Overture Maps Buildings (and optionally POIs) from S3 into PostGIS.
+Stream Overture Maps Buildings from S3 into PostGIS using the official spatial index.
 
 Features:
-- EFFICIENT S3 PARTITIONING: Uses Quadkey partitioning to only scan US-based data.
+- HIGHLY EFFICIENT: Reads the spatial index first to find exactly which Parquet files
+  intersect the target BBOX, avoiding scanning thousands of irrelevant files.
+- Uses authenticated S3 access.
 - First-run table creation: staging + main tables.
 - Incremental inserts: safe on restart or crash.
 - Checkpointing via PostgreSQL `load_log` table.
 - All operations for a row group are performed in a single, atomic transaction.
-- Correct on-the-fly CRS transformation using PostGIS.
-- Efficient, centralized S3 filesystem handling.
 """
 
 import time
 import pyarrow.parquet as pq
 import geopandas as gpd
 from shapely import wkb
+from shapely.geometry import box
 from sqlalchemy import create_engine, text
 from concurrent.futures import ThreadPoolExecutor
 import s3fs
@@ -26,7 +27,6 @@ from functools import partial
 # ----------------------- CONFIGURATION -----------------------
 POSTGIS_URL = "postgresql+psycopg2://docker:docker@localhost:25432/gis"
 MAIN_TABLE_BUILDINGS = "building_usa"
-# MAIN_TABLE_POIS = "poi_usa"
 
 NUM_WORKERS = 4
 BATCH_WORKERS = 4
@@ -37,15 +37,9 @@ RETRIES = 3
 RETRY_DELAY = 5
 USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
 
-# Overture uses a quadkey partitioning scheme. We can target only the
-# top-level quadkeys that cover the United States to avoid scanning the entire planet.
-# Zoom level 2 quadkeys for the USA are primarily within 02 and 03.
-# We can add more specific ones if needed (e.g., "10", "11" for parts of Alaska).
-USA_QUADKEY_PREFIXES = ["02", "03", "10", "11"]
-
-# We will build the S3 patterns dynamically based on these prefixes.
-BASE_S3_URL_BUILDINGS = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building"
-# BASE_S3_URL_POIS = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=places/type=place"
+# URL to the official spatial index for the buildings theme.
+# This file contains the bounding box for every Parquet file in the dataset.
+SPATIAL_INDEX_URL = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/spatial-index.geojson.gz"
 
 # Set to False for a full production run.
 STOP_AFTER_FIRST_SUCCESS = False
@@ -168,48 +162,64 @@ def process_row_group_task(task, s3fs_instance):
             time.sleep(RETRY_DELAY)
     return (False, 0)
 
-# ----------------------- TASK COLLECTION -----------------------
-def collect_row_group_tasks(jobs, s3fs_instance):
+# ----------------------- TASK COLLECTION (SPATIAL INDEX STRATEGY) -----------------------
+def get_intersecting_files(s3fs_instance):
+    """Reads the spatial index to find Parquet files that intersect the USA BBOX."""
+    print(f"[INFO] Reading spatial index to find relevant files: {SPATIAL_INDEX_URL}")
+    try:
+        with s3fs_instance.open(SPATIAL_INDEX_URL, 'rb') as f:
+            index_gdf = gpd.read_file(f)
+        
+        usa_polygon = box(*USA_BBOX)
+        
+        intersecting_idx = index_gdf.sindex.query(usa_polygon, predicate='intersects')
+        intersecting_files_gdf = index_gdf.iloc[intersecting_idx]
+        
+        base_s3_path = SPATIAL_INDEX_URL.rsplit('/', 1)[0]
+        file_list = [f"{base_s3_path}/{row['file']}" for _, row in intersecting_files_gdf.iterrows()]
+        
+        print(f"[INFO] Found {len(file_list)} Parquet files intersecting the USA BBOX.")
+        return file_list
+    except Exception as e:
+        print(f"[ERROR] Could not read or process the spatial index file. Error: {e}")
+        return []
+
+def collect_row_group_tasks(file_list, main_table, s3fs_instance):
+    """Generates row group tasks from a pre-filtered list of Parquet files."""
     tasks = []
-    for base_url, quad_prefixes, main_table in jobs:
-        for prefix in quad_prefixes:
-            pattern = f"{base_url}/quadkey={prefix}*"
-            print(f"[INFO] Searching for files with pattern: {pattern}")
-            try:
-                files = s3fs_instance.glob(pattern)
-                if not files:
-                    print(f"[DEBUG] No files found for pattern {pattern}")
-                    continue
-                
-                for file_path in files:
-                    parquet_url = f"s3://{file_path}"
-                    pf = pq.ParquetFile(parquet_url, filesystem=s3fs_instance)
-                    for rg_idx in range(pf.num_row_groups):
-                        if not row_group_already_done(parquet_url, rg_idx):
-                            tasks.append((parquet_url, rg_idx, main_table))
-            except Exception as e:
-                print(f"[WARNING] Could not process pattern {pattern}. Error: {e}")
+    for parquet_url in file_list:
+        try:
+            pf = pq.ParquetFile(parquet_url, filesystem=s3fs_instance)
+            for rg_idx in range(pf.num_row_groups):
+                if not row_group_already_done(parquet_url, rg_idx):
+                    tasks.append((parquet_url, rg_idx, main_table))
+        except Exception as e:
+            print(f"[WARNING] Could not read metadata from {parquet_url}. Skipping. Error: {e}")
     return tasks
 
-# ----------------------- MAIN FUNCTION -----------------------
+# ----------------------- MAIN FUNCTION (SPATIAL INDEX STRATEGY) -----------------------
 def main():
     overall_start = time.time()
     ensure_load_log_table()
-    s3 = s3fs.S3FileSystem(anon=True)
+    
+    # Use authenticated access for S3
+    s3 = s3fs.S3FileSystem()
 
-    jobs = [
-        (BASE_S3_URL_BUILDINGS, USA_QUADKEY_PREFIXES, MAIN_TABLE_BUILDINGS),
-        # (BASE_S3_URL_POIS, USA_QUADKEY_PREFIXES, MAIN_TABLE_POIS),
-    ]
-
-    tasks = collect_row_group_tasks(jobs, s3)
-    print(f"[INFO] Found {len(tasks)} total row-group tasks to process across all US partitions.")
-    if not tasks:
-        print("[INFO] No new tasks to process. Exiting.")
+    # 1. Get the precise list of files to process from the spatial index
+    intersecting_files = get_intersecting_files(s3)
+    if not intersecting_files:
+        print("[ERROR] No intersecting files found. Exiting.")
         return
 
-    worker_func = partial(process_row_group_task, s3fs_instance=s3)
+    # 2. Generate tasks only for the relevant files
+    tasks = collect_row_group_tasks(intersecting_files, MAIN_TABLE_BUILDINGS, s3)
+    print(f"[INFO] Found {len(tasks)} total row-group tasks to process.")
+    if not tasks:
+        print("[INFO] No new tasks to process. All relevant files are already logged as done.")
+        return
 
+    # 3. Execute the tasks
+    worker_func = partial(process_row_group_task, s3fs_instance=s3)
     with Pool(NUM_WORKERS) as pool:
         for success, row_count in tqdm(pool.imap_unordered(worker_func, tasks), total=len(tasks), desc="All RowGroups"):
             if success and row_count > 0:
@@ -221,9 +231,9 @@ def main():
             elif not success:
                 print(f"\n[ERROR] A task failed after all retries.")
 
+    # 4. Create indexes
     print("[INFO] Data loading complete. Creating indexes...")
-    for _, _, main_table in jobs:
-        create_indexes(main_table)
+    create_indexes(MAIN_TABLE_BUILDINGS)
 
     overall_end = time.time()
     print(f"[INFO] Total ETL runtime: {overall_end - overall_start:.1f} sec")
