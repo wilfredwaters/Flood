@@ -30,10 +30,16 @@ MAIN_TABLE_BUILDINGS = "building_usa"
 NUM_WORKERS = 4            # Global row group pool
 BATCH_WORKERS = 4          # Batch-level parallelism per row group
 BATCH_SIZE = 100_000
-TARGET_CRS = "EPSG:5070"
 RETRIES = 3
 RETRY_DELAY = 5  # seconds
 USA_BBOX = [-125.0, 24.0, -66.9, 49.4]
+
+# CRS and SRID configuration
+TARGET_CRS = "EPSG:5070"
+# <<<<<<< START OF FIX >>>>>>>
+# PostGIS expects an integer SRID, not the full "EPSG:xxxx" string
+TARGET_SRID = TARGET_CRS.split(':')[-1]
+# <<<<<<< END OF FIX >>>>>>>
 
 # S3 Parquet URL patterns
 BUILDINGS_S3_PATTERN = "s3://overturemaps-us-west-2/release/2025-07-23.0/theme=buildings/type=building/*"
@@ -91,8 +97,7 @@ def create_staging_table(parquet_file, staging_table, conn):
         col_name = field.name
         col_type_str = str(field.type).lower()
         
-        # Use unquoted identifiers unless necessary
-        pg_type = "TEXT" # Default
+        pg_type = "TEXT"
         if 'binary' in col_type_str: pg_type = "BYTEA"
         elif 'int64' in col_type_str: pg_type = "BIGINT"
         elif 'int32' in col_type_str: pg_type = "INTEGER"
@@ -100,7 +105,7 @@ def create_staging_table(parquet_file, staging_table, conn):
         elif 'bool' in col_type_str: pg_type = "BOOLEAN"
         
         if col_name == 'geometry':
-            pg_type = "GEOMETRY(Geometry, 4326)" # Staging table is always WGS 84
+            pg_type = "GEOMETRY(Geometry, 4326)"
 
         columns.append(f"{col_name} {pg_type}")
 
@@ -150,16 +155,21 @@ def process_row_group_task(task, s3fs_instance):
                 if not exists:
                     print(f"[DEBUG] Main table {main_table} does not exist, creating from {staging_table} ...")
                     conn.execute(text(f"CREATE TABLE {main_table} AS TABLE {staging_table} WITH NO DATA;"))
-                    conn.execute(text(f"ALTER TABLE {main_table} ALTER COLUMN geometry TYPE geometry(Geometry, {TARGET_CRS});"))
+                    # <<<<<<< START OF FIX >>>>>>>
+                    # Use the integer SRID for the ALTER TABLE command
+                    conn.execute(text(f"ALTER TABLE {main_table} ALTER COLUMN geometry TYPE geometry(Geometry, {TARGET_SRID});"))
+                    # <<<<<<< END OF FIX >>>>>>>
 
-                # Get column names from staging table to handle CRS transform
                 staging_cols_res = conn.execute(text(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{staging_table}' ORDER BY ordinal_position;"))
                 staging_cols = [row[0] for row in staging_cols_res]
                 
                 select_expressions = []
                 for col in staging_cols:
                     if col == 'geometry':
-                        select_expressions.append(f"ST_Transform(geometry, {TARGET_CRS})")
+                        # <<<<<<< START OF FIX >>>>>>>
+                        # Use the integer SRID for the ST_Transform function
+                        select_expressions.append(f"ST_Transform(geometry, {TARGET_SRID})")
+                        # <<<<<<< END OF FIX >>>>>>>
                     else:
                         select_expressions.append(col)
                 
@@ -190,7 +200,6 @@ def collect_row_group_tasks(parquet_patterns, s3fs_instance):
             try:
                 pf = pq.ParquetFile(parquet_url, filesystem=s3fs_instance)
                 for rg_idx in range(pf.num_row_groups):
-                    # In test mode, grab the very first row group and exit
                     if TEST_FIRST_ROW_GROUP_ONLY:
                         print("[INFO] TEST_FIRST_ROW_GROUP_ONLY is True. Processing only one task.")
                         return [(parquet_url, rg_idx, main_table)]
@@ -206,7 +215,6 @@ def main():
     overall_start = time.time()
     ensure_load_log_table()
 
-    # Create a single S3 filesystem instance to be reused
     s3 = s3fs.S3FileSystem(anon=True)
 
     jobs = [
@@ -224,16 +232,14 @@ def main():
     from multiprocessing import Pool
     from functools import partial
 
-    # Create a partial function to pass the s3 instance to the worker processes
     worker_func = partial(process_row_group_task, s3fs_instance=s3)
 
     with Pool(NUM_WORKERS) as pool:
-        for success in tqdm(
+        for _ in tqdm(
                 pool.imap_unordered(worker_func, tasks),
                 total=len(tasks),
                 desc="All RowGroups"
         ):
-            # Error logging is now handled inside the task itself
             pass
 
     print("[INFO] Data loading complete. Creating indexes...")
